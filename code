@@ -1,0 +1,172 @@
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, GridSearchCV, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+f1_score, roc_auc_score, confusion_matrix,
+classification_report, roc_curve)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+import xgboost as xgb
+import lightgbm as lgb
+from time import time
+import shap
+# Load Dataset
+train_df = pd.read_csv('train.csv')
+test_df = pd.read_csv('test.csv')
+# Data Preprocessing and Feature Engineering
+def preprocess_data(df):
+# Extract title from names
+df['Title'] = df['Name'].str.extract(' ([A-Za-z]+)\.', expand=False)
+df['Title'] = df['Title'].replace(['Lady', 'Countess','Capt', 'Col','Don',
+'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer', 'Dona'], 'Rare')
+df['Title'] = df['Title'].replace('Mlle', 'Miss')
+df['Title'] = df['Title'].replace('Ms', 'Miss')
+df['Title'] = df['Title'].replace('Mme', 'Mrs')
+# Family features
+df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
+df['IsAlone'] = 0
+df.loc[df['FamilySize'] == 1, 'IsAlone'] = 1
+# Cabin features
+df['Deck'] = df['Cabin'].str[0]
+df['Deck'] = df['Deck'].fillna('U')
+# Age imputation
+df['Age'] = df.groupby(['Sex', 'Pclass', 'Title'])['Age'].apply(
+lambda x: x.fillna(x.median()))
+# Fare imputation
+df['Fare'] = df['Fare'].fillna(df.groupby('Pclass')['Fare'].transform('median'))
+# Drop unnecessary columns
+df = df.drop(['PassengerId', 'Name', 'Ticket', 'Cabin'], axis=1)
+return df
+train_df = preprocess_data(train_df)
+test_df = preprocess_data(test_df)
+# Define features and target
+X = train_df.drop('Survived', axis=1)
+y = train_df['Survived']
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(
+X, y, test_size=0.2, random_state=42, stratify=y)
+# Preprocessing pipeline
+numeric_features = ['Age', 'Fare', 'SibSp', 'Parch', 'FamilySize']
+categorical_features = ['Pclass', 'Sex', 'Embarked', 'Title', 'Deck', 'IsAlone']
+preprocessor = ColumnTransformer(
+transformers=[
+('num', StandardScaler(), numeric_features),
+('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)])
+# Baseline Models Comparison
+models = {
+'Logistic Regression': LogisticRegression(max_iter=1000),
+'Random Forest': RandomForestClassifier(random_state=42),
+'Gradient Boosting': GradientBoostingClassifier(random_state=42),
+'SVM': SVC(probability=True, random_state=42),
+'k-NN': KNeighborsClassifier(),
+'XGBoost': xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss'),
+'LightGBM': lgb.LGBMClassifier(random_state=42)
+}
+baseline_results = []
+for name, model in models.items():
+pipeline = Pipeline(steps=[
+('preprocessor', preprocessor),
+('classifier', model)
+])
+start_time = time()
+pipeline.fit(X_train, y_train)
+train_time = time() - start_time
+y_pred = pipeline.predict(X_test)
+y_proba = pipeline.predict_proba(X_test)[:,1]
+metrics = {
+'Model': name,
+'Accuracy': accuracy_score(y_test, y_pred),
+'Precision': precision_score(y_test, y_pred),
+'Recall': recall_score(y_test, y_pred),
+'F1': f1_score(y_test, y_pred),
+'ROC AUC': roc_auc_score(y_test, y_proba),
+'Train Time (s)': train_time
+}
+baseline_results.append(metrics)
+baseline_df = pd.DataFrame(baseline_results)
+# Hyperparameter Tuning
+param_grids = {
+'Random Forest': {
+'classifier__n_estimators': [100, 200, 300],
+'classifier__max_depth': [None, 5, 10],
+'classifier__min_samples_split': [2, 5]
+},
+'Gradient Boosting': {
+'classifier__n_estimators': [100, 200],
+'classifier__learning_rate': [0.05, 0.1],
+'classifier__max_depth': [3, 5]
+},
+'XGBoost': {
+'classifier__n_estimators': [100, 200],
+'classifier__learning_rate': [0.05, 0.1],
+'classifier__max_depth': [3, 5],
+'classifier__subsample': [0.8, 1.0]
+},
+'LightGBM': {
+'classifier__num_leaves': [31, 63],
+'classifier__learning_rate': [0.05, 0.1],
+'classifier__n_estimators': [100, 200]
+}
+}
+tuned_results = []
+for model_name in ['Random Forest', 'Gradient Boosting', 'XGBoost', 'LightGBM']:
+model = models[model_name]
+pipeline = Pipeline(steps=[
+('preprocessor', preprocessor),
+('classifier', model)
+])
+grid_search = GridSearchCV(
+pipeline,
+param_grids[model_name],
+cv=5,
+scoring='accuracy',
+n_jobs=-1
+)
+start_time = time()
+grid_search.fit(X_train, y_train)
+train_time = time() - start_time
+best_model = grid_search.best_estimator_
+y_pred = best_model.predict(X_test)
+y_proba = best_model.predict_proba(X_test)[:,1]
+metrics = {
+'Model': f'Tuned {model_name}',
+'Accuracy': accuracy_score(y_test, y_pred),
+'Precision': precision_score(y_test, y_pred),
+'Recall': recall_score(y_test, y_pred),
+'F1': f1_score(y_test, y_pred),
+'ROC AUC': roc_auc_score(y_test, y_proba),
+'Train Time (s)': train_time,
+'Best Params': grid_search.best_params_
+}
+tuned_results.append(metrics)
+tuned_df = pd.DataFrame(tuned_results)
+# Efficiency Analysis
+# Compare baseline and tuned models
+efficiency_df = pd.concat([baseline_df, tuned_df])
+# Feature Importance Analysis
+# Using SHAP values for best model
+best_model = tuned_df.loc[tuned_df['Accuracy'].idxmax(), 'Model']
+pipeline = Pipeline(steps=[
+('preprocessor', preprocessor),
+('classifier', models[best_model.split()[-1]])
+])
+pipeline.fit(X_train, y_train)
+explainer = shap.TreeExplainer(pipeline.named_steps['classifier'])
+transformed_data = pipeline.named_steps['preprocessor'].transform(X_train)
+shap_values = explainer.shap_values(transformed_data)
+shap.summary_plot(shap_values, transformed_data,
+feature_names=pipeline.named_steps['preprocessor'].get_feature_names_out())
+# Generate comparison plots
+plt.figure(figsize=(12,8))
+sns.barplot(x='Accuracy', y='Model', data=efficiency_df.sort_values('Accuracy', ascending=False))
+plt.title('Model Accuracy Comparison')
+plt.xlabel('Accuracy')
+plt.ylabel('Model')
+plt.show()
